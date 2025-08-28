@@ -36,6 +36,45 @@ success() {
     echo -e "${GREEN}[SUCCESS]${NC} $1" | tee -a "$LOG_FILE"
 }
 
+# Fix permissions if running with sudo or having permission issues
+fix_permissions() {
+    log "Checking and fixing permissions..."
+    
+    # Check if we need to fix permissions
+    if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
+        log "Running as sudo, fixing file ownership..."
+        ACTUAL_USER=$SUDO_USER
+        ACTUAL_GROUP=$(id -gn $SUDO_USER)
+        
+        # Change ownership of the entire project directory
+        chown -R $ACTUAL_USER:$ACTUAL_GROUP "$PROJECT_DIR"
+        log "Changed ownership to $ACTUAL_USER:$ACTUAL_GROUP"
+        
+    elif [ "$EUID" -eq 0 ]; then
+        warning "Running as root without sudo - files will be owned by root"
+    fi
+    
+    # Create necessary directories
+    mkdir -p "$BACKUP_DIR"
+    mkdir -p "$PROJECT_DIR/uploads"
+    mkdir -p "$(dirname "$LOG_FILE")"
+    
+    # Ensure log file is writable
+    touch "$LOG_FILE" 2>/dev/null || {
+        if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
+            touch "$LOG_FILE"
+            chown $ACTUAL_USER:$ACTUAL_GROUP "$LOG_FILE"
+        else
+            error "Cannot create log file $LOG_FILE - check permissions"
+        fi
+    }
+    
+    # Make scripts executable
+    chmod +x "$SCRIPT_DIR"/*.sh 2>/dev/null || true
+    
+    success "Permissions fixed"
+}
+
 # Check prerequisites
 check_prerequisites() {
     log "Checking prerequisites..."
@@ -255,9 +294,8 @@ main() {
     echo "================================================================"
     echo -e "${NC}"
     
-    # Create log file
-    mkdir -p "$(dirname "$LOG_FILE")"
-    touch "$LOG_FILE"
+    # Fix permissions first (before creating log file)
+    fix_permissions
     
     # Check if this is a rollback
     if [ "$1" = "--rollback" ]; then
