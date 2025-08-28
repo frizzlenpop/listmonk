@@ -1,0 +1,195 @@
+# Multi-Tenant Listmonk Docker Compose Configuration
+# This configuration includes all necessary environment variables for multi-tenancy support
+# 
+# Usage:
+# 1. Copy your existing uploads directory: cp -r uploads uploads_backup
+# 2. Update environment variables in .env file
+# 3. Run: docker-compose -f docker-compose.multitenant.yml up -d
+
+version: "3.7"
+
+# All LISTMONK_* env variables also support the LISTMONK_*_FILE pattern for loading values from files,
+# eg: LISTMONK_ADMIN_USER -> LISTMONK_ADMIN_USER_FILE=/path/to/file_with_value
+x-db-credentials: &db-credentials
+  POSTGRES_USER: &db-user listmonk
+  POSTGRES_PASSWORD: &db-password listmonk2024
+  POSTGRES_DB: &db-name listmonk
+
+services:
+  # Multi-tenant Listmonk app
+  app:
+    image: listmonk/listmonk:latest
+    container_name: listmonk_app_mt
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    networks:
+      - listmonk
+    hostname: listmonk.example.com
+    depends_on:
+      db:
+        condition: service_healthy
+    command: [sh, -c, "./listmonk --install --idempotent --yes --config '' && ./listmonk"]
+    
+    environment:
+      # Core application settings
+      LISTMONK_app__address: 0.0.0.0:9000
+      
+      # Database configuration
+      LISTMONK_db__user: *db-user
+      LISTMONK_db__password: *db-password
+      LISTMONK_db__database: *db-name
+      LISTMONK_db__host: listmonk_db
+      LISTMONK_db__port: 5432
+      LISTMONK_db__ssl_mode: disable
+      LISTMONK_db__max_open: 25
+      LISTMONK_db__max_idle: 25
+      LISTMONK_db__max_lifetime: 300s
+      
+      # System configuration
+      TZ: Etc/UTC
+      LISTMONK_ADMIN_USER: ${LISTMONK_ADMIN_USER:-}
+      LISTMONK_ADMIN_PASSWORD: ${LISTMONK_ADMIN_PASSWORD:-}
+      
+      # Multi-tenancy core configuration
+      LISTMONK_MULTITENANCY_ENABLED: ${LISTMONK_MULTITENANCY_ENABLED:-true}
+      LISTMONK_DEFAULT_TENANT_ID: ${LISTMONK_DEFAULT_TENANT_ID:-1}
+      LISTMONK_SUPER_ADMIN_EMAIL: ${LISTMONK_SUPER_ADMIN_EMAIL:-admin@localhost}
+      
+      # Tenant domain configuration
+      LISTMONK_TENANT_DOMAIN_SUFFIX: ${LISTMONK_TENANT_DOMAIN_SUFFIX:-.listmonk.localhost}
+      LISTMONK_TENANT_BASE_DOMAIN: ${LISTMONK_TENANT_BASE_DOMAIN:-localhost}
+      
+      # Tenant resolution methods
+      LISTMONK_TENANT_RESOLUTION_SUBDOMAIN: ${LISTMONK_TENANT_RESOLUTION_SUBDOMAIN:-true}
+      LISTMONK_TENANT_RESOLUTION_DOMAIN: ${LISTMONK_TENANT_RESOLUTION_DOMAIN:-true}
+      LISTMONK_TENANT_RESOLUTION_HEADER: ${LISTMONK_TENANT_RESOLUTION_HEADER:-true}
+      LISTMONK_TENANT_RESOLUTION_QUERY: ${LISTMONK_TENANT_RESOLUTION_QUERY:-false}
+      
+      # Default tenant settings for new installations
+      LISTMONK_DEFAULT_TENANT_NAME: ${LISTMONK_DEFAULT_TENANT_NAME:-Default Organization}
+      LISTMONK_DEFAULT_TENANT_SLUG: ${LISTMONK_DEFAULT_TENANT_SLUG:-default}
+      LISTMONK_DEFAULT_TENANT_DOMAIN: ${LISTMONK_DEFAULT_TENANT_DOMAIN:-}
+      
+      # Tenant isolation and security
+      LISTMONK_TENANT_STRICT_MODE: ${LISTMONK_TENANT_STRICT_MODE:-true}
+      LISTMONK_TENANT_AUTO_CREATE: ${LISTMONK_TENANT_AUTO_CREATE:-false}
+      
+      # File storage configuration for multi-tenancy
+      LISTMONK_TENANT_UPLOADS_SEGREGATED: ${LISTMONK_TENANT_UPLOADS_SEGREGATED:-true}
+      
+      # Performance and caching
+      LISTMONK_TENANT_CACHE_ENABLED: ${LISTMONK_TENANT_CACHE_ENABLED:-true}
+      LISTMONK_TENANT_CACHE_TTL: ${LISTMONK_TENANT_CACHE_TTL:-300}
+    
+    volumes:
+      # Tenant-segregated uploads - each tenant gets its own subdirectory
+      - ./uploads:/listmonk/uploads:rw
+      # Optional: Mount custom templates directory
+      - ./templates:/listmonk/static/email-templates:ro
+      # Optional: Mount custom static files
+      - ./static:/listmonk/static/public:ro
+    
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # PostgreSQL database with multi-tenancy optimizations
+  db:
+    image: postgres:17-alpine
+    container_name: listmonk_db_mt
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    networks:
+      - listmonk
+    environment:
+      <<: *db-credentials
+      # Performance optimizations for multi-tenancy
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    
+    # Enhanced configuration for multi-tenant performance
+    command: [
+      "postgres",
+      "-c", "shared_preload_libraries=pg_stat_statements",
+      "-c", "pg_stat_statements.track=all",
+      "-c", "max_connections=200",
+      "-c", "shared_buffers=256MB",
+      "-c", "effective_cache_size=1GB",
+      "-c", "maintenance_work_mem=64MB",
+      "-c", "checkpoint_completion_target=0.9",
+      "-c", "wal_buffers=16MB",
+      "-c", "default_statistics_target=100",
+      "-c", "random_page_cost=1.1",
+      "-c", "effective_io_concurrency=200",
+      "-c", "work_mem=4MB",
+      "-c", "min_wal_size=1GB",
+      "-c", "max_wal_size=4GB",
+      "-c", "max_worker_processes=8",
+      "-c", "max_parallel_workers_per_gather=4",
+      "-c", "max_parallel_workers=8",
+      "-c", "max_parallel_maintenance_workers=4"
+    ]
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U listmonk -d listmonk"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    
+    volumes:
+      - type: volume
+        source: listmonk-data
+        target: /var/lib/postgresql/data
+      # Optional: Mount custom initialization scripts
+      - ./docker-init:/docker-entrypoint-initdb.d:ro
+
+  # Optional: Redis for tenant caching and session management
+  redis:
+    image: redis:7-alpine
+    container_name: listmonk_redis_mt
+    restart: unless-stopped
+    networks:
+      - listmonk
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    volumes:
+      - redis-data:/data
+
+  # Optional: Reverse proxy for subdomain/domain routing (production)
+  # Uncomment and configure for production use
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: listmonk_nginx_mt
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   networks:
+  #     - listmonk
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - ./ssl:/etc/nginx/ssl:ro
+  #   depends_on:
+  #     - app
+
+networks:
+  listmonk:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  listmonk-data:
+    driver: local
+  redis-data:
+    driver: local

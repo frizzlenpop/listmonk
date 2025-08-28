@@ -1,0 +1,542 @@
+# Production Multi-Tenant Listmonk Docker Compose Configuration
+# This configuration is optimized for production deployment with security, performance, and monitoring
+#
+# Prerequisites:
+# 1. Set up proper DNS records for subdomains/custom domains
+# 2. Configure SSL certificates 
+# 3. Update environment variables in .env file
+# 4. Review security settings and firewall rules
+#
+# Usage:
+# docker-compose -f docker-compose.production.yml up -d
+
+version: "3.8"
+
+# Shared configuration
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-db-credentials: &db-credentials
+  POSTGRES_USER: &db-user listmonk
+  POSTGRES_PASSWORD_FILE: &db-password /run/secrets/postgres_password
+  POSTGRES_DB: &db-name listmonk
+
+# Docker secrets for production security
+secrets:
+  postgres_password:
+    external: true
+  listmonk_admin_password:
+    external: true
+  jwt_secret:
+    external: true
+  ssl_cert:
+    external: true
+  ssl_key:
+    external: true
+
+services:
+  # Production Multi-tenant Listmonk application
+  app:
+    image: listmonk/listmonk:latest
+    container_name: listmonk_app_prod
+    restart: unless-stopped
+    # Don't expose ports directly in production - use reverse proxy
+    expose:
+      - "9000"
+    networks:
+      - listmonk_internal
+      - web_public
+    hostname: listmonk.${BASE_DOMAIN:-yourdomain.com}
+    
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    
+    # Use secrets for sensitive data
+    secrets:
+      - listmonk_admin_password
+      - jwt_secret
+    
+    # Enhanced security - run as non-root user
+    user: "listmonk:listmonk"
+    
+    # Production startup with proper migration handling
+    command: [
+      "sh", "-c",
+      "echo 'Starting production multi-tenant Listmonk...' && \
+       ./listmonk --install --idempotent --yes --config '' && \
+       echo 'Migration complete, starting application...' && \
+       ./listmonk"
+    ]
+    
+    environment:
+      # Core application settings
+      LISTMONK_app__address: 0.0.0.0:9000
+      LISTMONK_app__admin_username: ${LISTMONK_ADMIN_USER}
+      LISTMONK_app__admin_password_file: /run/secrets/listmonk_admin_password
+      
+      # Database configuration with connection pooling
+      LISTMONK_db__user: *db-user
+      LISTMONK_db__password_file: *db-password
+      LISTMONK_db__database: *db-name
+      LISTMONK_db__host: listmonk_db_prod
+      LISTMONK_db__port: 5432
+      LISTMONK_db__ssl_mode: require
+      LISTMONK_db__max_open: 50
+      LISTMONK_db__max_idle: 25
+      LISTMONK_db__max_lifetime: 300s
+      LISTMONK_db__timeout: 10s
+      
+      # Multi-tenancy production configuration
+      LISTMONK_MULTITENANCY_ENABLED: "true"
+      LISTMONK_DEFAULT_TENANT_ID: 1
+      LISTMONK_SUPER_ADMIN_EMAIL: ${SUPER_ADMIN_EMAIL}
+      
+      # Domain configuration for production
+      LISTMONK_TENANT_BASE_DOMAIN: ${BASE_DOMAIN:-yourdomain.com}
+      LISTMONK_TENANT_DOMAIN_SUFFIX: .listmonk.${BASE_DOMAIN:-yourdomain.com}
+      
+      # Tenant resolution (production-ready)
+      LISTMONK_TENANT_RESOLUTION_SUBDOMAIN: "true"
+      LISTMONK_TENANT_RESOLUTION_DOMAIN: "true"
+      LISTMONK_TENANT_RESOLUTION_HEADER: "true"
+      LISTMONK_TENANT_RESOLUTION_QUERY: "false"  # Disabled for production security
+      
+      # Security settings
+      LISTMONK_TENANT_STRICT_MODE: "true"
+      LISTMONK_TENANT_AUTO_CREATE: "false"
+      LISTMONK_security__enable_captcha: "true"
+      LISTMONK_security__captcha_key: ${CAPTCHA_KEY}
+      LISTMONK_security__captcha_secret: ${CAPTCHA_SECRET}
+      
+      # Performance and caching
+      LISTMONK_TENANT_CACHE_ENABLED: "true"
+      LISTMONK_TENANT_CACHE_TTL: 600
+      LISTMONK_TENANT_CACHE_BACKEND: redis
+      LISTMONK_TENANT_REDIS_HOST: redis:6379
+      LISTMONK_TENANT_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      
+      # File storage and uploads
+      LISTMONK_TENANT_UPLOADS_SEGREGATED: "true"
+      LISTMONK_TENANT_UPLOADS_S3_ENABLED: ${S3_ENABLED:-false}
+      LISTMONK_TENANT_UPLOADS_S3_BUCKET: ${S3_BUCKET}
+      LISTMONK_TENANT_UPLOADS_S3_REGION: ${S3_REGION}
+      LISTMONK_TENANT_UPLOADS_S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      LISTMONK_TENANT_UPLOADS_S3_SECRET_KEY: ${S3_SECRET_KEY}
+      
+      # Monitoring and logging
+      LISTMONK_log__level: info
+      LISTMONK_log__format: json
+      LISTMONK_PROMETHEUS_ENABLED: "true"
+      LISTMONK_PROMETHEUS_PORT: 9090
+      
+      # Security headers and CORS
+      LISTMONK_app__enable_public_archive: ${ENABLE_PUBLIC_ARCHIVE:-false}
+      LISTMONK_security__enable_csrf: "true"
+      LISTMONK_security__cors_origins: https://*.${BASE_DOMAIN:-yourdomain.com}
+      
+      # System configuration
+      TZ: ${TIMEZONE:-UTC}
+      PUID: 1001
+      PGID: 1001
+    
+    volumes:
+      # Tenant-segregated persistent storage
+      - listmonk_uploads:/listmonk/uploads:rw
+      - listmonk_templates:/listmonk/static/email-templates:ro
+      - listmonk_logs:/var/log/listmonk:rw
+      # Static files (read-only for security)
+      - listmonk_static:/listmonk/static/public:ro
+    
+    # Production health checks
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    # Security and resource limits
+    security_opt:
+      - no-new-privileges:true
+    read_only: false  # Application needs write access to uploads
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m
+    
+    # Resource limits for production
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
+    
+    logging: *default-logging
+    
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web_public"
+      - "traefik.http.routers.listmonk.rule=Host(`*.listmonk.${BASE_DOMAIN}`) || Host(`listmonk.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.listmonk.tls=true"
+      - "traefik.http.routers.listmonk.tls.certresolver=letsencrypt"
+      - "traefik.http.services.listmonk.loadbalancer.server.port=9000"
+
+  # Production PostgreSQL with enhanced security and performance
+  db:
+    image: postgres:17-alpine
+    container_name: listmonk_db_prod
+    restart: unless-stopped
+    # No external port exposure for security
+    expose:
+      - "5432"
+    networks:
+      - listmonk_internal
+    
+    secrets:
+      - postgres_password
+    
+    environment:
+      <<: *db-credentials
+      POSTGRES_INITDB_ARGS: "--data-checksums --auth-host=scram-sha-256"
+      # Enhanced security
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+    
+    # Production PostgreSQL configuration
+    command: [
+      "postgres",
+      # Extensions and monitoring
+      "-c", "shared_preload_libraries=pg_stat_statements",
+      "-c", "pg_stat_statements.track=all",
+      "-c", "pg_stat_statements.max=10000",
+      
+      # Connection and authentication
+      "-c", "max_connections=300",
+      "-c", "password_encryption=scram-sha-256",
+      "-c", "ssl=on",
+      "-c", "ssl_cert_file=/var/lib/postgresql/server.crt",
+      "-c", "ssl_key_file=/var/lib/postgresql/server.key",
+      
+      # Memory and performance tuning
+      "-c", "shared_buffers=512MB",
+      "-c", "effective_cache_size=2GB",
+      "-c", "maintenance_work_mem=128MB",
+      "-c", "work_mem=8MB",
+      
+      # WAL and checkpointing
+      "-c", "wal_buffers=32MB",
+      "-c", "checkpoint_completion_target=0.9",
+      "-c", "max_wal_size=8GB",
+      "-c", "min_wal_size=2GB",
+      "-c", "wal_level=replica",
+      
+      # Query optimization
+      "-c", "default_statistics_target=100",
+      "-c", "random_page_cost=1.1",
+      "-c", "effective_io_concurrency=200",
+      
+      # Parallel processing
+      "-c", "max_worker_processes=8",
+      "-c", "max_parallel_workers_per_gather=4",
+      "-c", "max_parallel_workers=8",
+      "-c", "max_parallel_maintenance_workers=4",
+      
+      # Logging for monitoring
+      "-c", "log_min_duration_statement=1000",
+      "-c", "log_line_prefix='%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '",
+      "-c", "log_checkpoints=on",
+      "-c", "log_connections=on",
+      "-c", "log_disconnections=on",
+      "-c", "log_lock_waits=on"
+    ]
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U listmonk -d listmonk"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    volumes:
+      - listmonk_db:/var/lib/postgresql/data
+      # SSL certificates for database encryption
+      - ./ssl/db-server.crt:/var/lib/postgresql/server.crt:ro
+      - ./ssl/db-server.key:/var/lib/postgresql/server.key:ro
+      # Backup scripts and maintenance
+      - ./db-backup:/backup:rw
+      - ./db-init:/docker-entrypoint-initdb.d:ro
+    
+    # Database security
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    tmpfs:
+      - /tmp:noexec,nosuid,size=200m
+      - /var/run/postgresql:noexec,nosuid,size=100m
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 1G
+          cpus: "1.0"
+    
+    logging: *default-logging
+
+  # Redis for caching and session management
+  redis:
+    image: redis:7-alpine
+    container_name: listmonk_redis_prod
+    restart: unless-stopped
+    expose:
+      - "6379"
+    networks:
+      - listmonk_internal
+    
+    command: [
+      "redis-server",
+      "--requirepass", "${REDIS_PASSWORD}",
+      "--maxmemory", "512mb",
+      "--maxmemory-policy", "allkeys-lru",
+      "--save", "900", "1",
+      "--save", "300", "10",
+      "--save", "60", "10000",
+      "--tcp-keepalive", "300",
+      "--timeout", "300"
+    ]
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    
+    volumes:
+      - redis_data:/data
+    
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=50m
+    
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+        reservations:
+          memory: 256M
+          cpus: "0.25"
+    
+    logging: *default-logging
+
+  # Reverse proxy with SSL termination and tenant routing
+  nginx:
+    image: nginx:alpine
+    container_name: listmonk_nginx_prod
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - web_public
+      - listmonk_internal
+    
+    depends_on:
+      - app
+    
+    volumes:
+      # Nginx configuration for multi-tenant routing
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      # SSL certificates
+      - ./ssl:/etc/nginx/ssl:ro
+      # ACME challenge for Let's Encrypt
+      - acme_challenge:/var/www/html/.well-known/acme-challenge
+    
+    # Security headers and hardening
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:noexec,nosuid,size=100m
+      - /var/run:noexec,nosuid,size=10m
+      - /tmp:noexec,nosuid,size=50m
+    
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 128M
+          cpus: "0.25"
+    
+    logging: *default-logging
+    
+    labels:
+      - "traefik.enable=false"  # Using nginx as primary reverse proxy
+
+  # Optional: Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: listmonk_prometheus
+    restart: unless-stopped
+    expose:
+      - "9090"
+    networks:
+      - listmonk_internal
+      - monitoring
+    
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    
+    logging: *default-logging
+
+  # Optional: Grafana for dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: listmonk_grafana
+    restart: unless-stopped
+    expose:
+      - "3000"
+    networks:
+      - monitoring
+      - web_public
+    
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana:/etc/grafana/provisioning:ro
+    
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    
+    logging: *default-logging
+
+networks:
+  # Internal network for database and cache communication
+  listmonk_internal:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+  
+  # Public network for web traffic
+  web_public:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+  
+  # Monitoring network
+  monitoring:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.22.0.0/16
+
+volumes:
+  # Application data
+  listmonk_uploads:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/uploads
+  
+  listmonk_templates:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/templates
+      
+  listmonk_static:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/static
+      
+  listmonk_logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./logs
+  
+  # Database storage
+  listmonk_db:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/postgres
+  
+  # Cache storage
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/redis
+  
+  # Monitoring storage
+  prometheus_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/prometheus
+      
+  grafana_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/grafana
+  
+  # SSL certificate challenge
+  acme_challenge:
+    driver: local

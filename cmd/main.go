@@ -25,6 +25,7 @@ import (
 	"github.com/knadh/listmonk/internal/manager"
 	"github.com/knadh/listmonk/internal/media"
 	"github.com/knadh/listmonk/internal/messenger/email"
+	"github.com/knadh/listmonk/internal/middleware"
 	"github.com/knadh/listmonk/internal/subimporter"
 	"github.com/knadh/listmonk/models"
 	"github.com/knadh/paginator"
@@ -52,6 +53,9 @@ type App struct {
 	events     *events.Events
 	log        *log.Logger
 	bufLog     *buflog.BufLog
+
+	// Tenant middleware for multi-tenancy support
+	tenantMiddleware *middleware.TenantMiddleware
 
 	about         about
 	fnOptinNotify func(models.Subscriber, []int) (int, error)
@@ -198,6 +202,9 @@ func main() {
 		// Initialize the auth manager.
 		hasUsers, auth = initAuth(core, db.DB, ko)
 
+		// Tenant middleware for multi-tenancy support.
+		tenantMW = initTenantMiddleware(db, queries, cfg)
+
 		// Initialize the webhook/POP3 bounce processor.
 		bounce *bounce.Manager
 
@@ -261,6 +268,9 @@ func main() {
 		log:        lo,
 		events:     evStream,
 		bufLog:     bufLog,
+
+		// Tenant middleware
+		tenantMiddleware: tenantMW,
 
 		pg: paginator.New(paginator.Opt{
 			DefaultPerPage: 20,

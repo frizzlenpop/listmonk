@@ -44,6 +44,29 @@ type Store interface {
 	DeleteSubscriber(id int64) error
 }
 
+// TenantStore extends Store with tenant-aware operations for multi-tenant campaign processing.
+type TenantStore interface {
+	Store
+	// NextTenantCampaigns retrieves active campaigns for a specific tenant
+	NextTenantCampaigns(tenantID int, currentIDs []int64, sentCounts []int64) ([]*models.Campaign, error)
+	// NextTenantSubscribers retrieves subscribers for a campaign within a tenant
+	NextTenantSubscribers(tenantID, campID, limit int) ([]models.Subscriber, error)
+	// GetTenantCampaign fetches a campaign from a specific tenant
+	GetTenantCampaign(tenantID, campID int) (*models.Campaign, error)
+	// GetTenantSettings retrieves tenant-specific settings (SMTP, etc.)
+	GetTenantSettings(tenantID int) (map[string]interface{}, error)
+	// UpdateTenantCampaignStatus updates a campaign status within a tenant
+	UpdateTenantCampaignStatus(tenantID, campID int, status string) error
+	// UpdateTenantCampaignCounts updates campaign counts for a tenant-specific campaign
+	UpdateTenantCampaignCounts(tenantID, campID int, toSend int, sent int, lastSubID int) error
+	// CreateTenantLink creates a tracking link for a tenant
+	CreateTenantLink(tenantID int, url string) (string, error)
+	// BlocklistTenantSubscriber blocklists a subscriber within a tenant
+	BlocklistTenantSubscriber(tenantID int, id int64) error
+	// DeleteTenantSubscriber deletes a subscriber within a tenant
+	DeleteTenantSubscriber(tenantID int, id int64) error
+}
+
 // Messenger is an interface for a generic messaging backend,
 // for instance, e-mail, SMS etc.
 type Messenger interface {
@@ -94,6 +117,97 @@ type Manager struct {
 	tplFuncs template.FuncMap
 }
 
+// TenantManager handles multi-tenant campaign processing with isolated
+// per-tenant job queues and configurations.
+type TenantManager struct {
+	cfg           Config
+	tenantStore   TenantStore
+	i18n          *i18n.I18n
+	fnNotify      func(tenantID int, subject string, data any) error
+	log           *log.Logger
+
+	// Per-tenant managers for isolated processing
+	tenantManagers    map[int]*tenantInstanceManager
+	tenantManagersMut sync.RWMutex
+
+	// Global template functions
+	tplFuncs template.FuncMap
+
+	// Tenant discovery and lifecycle management
+	activeTenants    map[int]bool
+	activeTenantsMut sync.RWMutex
+
+	// Control channels
+	shutdownCh chan struct{}
+	wg         sync.WaitGroup
+}
+
+// tenantInstanceManager handles campaign processing for a single tenant
+type tenantInstanceManager struct {
+	tenantID   int
+	cfg        TenantConfig
+	store      TenantStore
+	messengers map[string]Messenger
+	i18n       *i18n.I18n
+	fnNotify   func(tenantID int, subject string, data any) error
+	log        *log.Logger
+
+	// Tenant-specific processing state
+	pipes    map[int]*tenantPipe
+	pipesMut sync.RWMutex
+
+	tpls    map[int]*models.Template
+	tplsMut sync.RWMutex
+
+	links    map[string]string
+	linksMut sync.RWMutex
+
+	// Tenant-specific processing queues
+	nextPipes chan *tenantPipe
+	campMsgQ  chan TenantCampaignMessage
+	msgQ      chan models.Message
+
+	// Tenant-specific rate limiting
+	slidingCount int
+	slidingStart time.Time
+
+	// Lifecycle management
+	active    bool
+	activeMut sync.RWMutex
+	stopCh    chan struct{}
+	wg        sync.WaitGroup
+
+	tplFuncs template.FuncMap
+}
+
+// TenantConfig extends Config with tenant-specific settings
+type TenantConfig struct {
+	Config
+	TenantID int
+	
+	// Tenant-specific SMTP settings loaded from tenant_settings
+	TenantFromEmail      string
+	TenantSMTPHost       string
+	TenantSMTPPort       int
+	TenantSMTPUsername   string
+	TenantSMTPPassword   string
+	TenantSMTPTLS        bool
+	TenantSMTPSkipVerify bool
+	
+	// Tenant-specific URLs and branding
+	TenantRootURL     string
+	TenantUnsubURL    string
+	TenantOptinURL    string
+	TenantMessageURL  string
+	TenantArchiveURL  string
+	
+	// Tenant-specific limits and features
+	TenantMaxBatchSize     int
+	TenantMaxConcurrency   int
+	TenantMessageRate      int
+	TenantMaxSendErrors    int
+}
+
 // CampaignMessage represents an instance of campaign message to be pushed out,
 // specific to a subscriber, via the campaign's messenger.
 type CampaignMessage struct {
@@ -108,6 +222,22 @@ type CampaignMessage struct {
 	unsubURL string
 
 	pipe *pipe
+}
+
+// TenantCampaignMessage extends CampaignMessage with tenant context
+type TenantCampaignMessage struct {
+	TenantID   int
+	Campaign   *models.Campaign
+	Subscriber models.Subscriber
+
+	from     string
+	to       string
+	subject  string
+	body     []byte
+	altBody  []byte
+	unsubURL string
+
+	pipe *tenantPipe
 }
 
 // Config has parameters for configuring the manager.
@@ -145,7 +275,37 @@ type Config struct {
 
 var pushTimeout = time.Second * 3
 
+// NewTenantManager returns a new instance of multi-tenant Manager.
+func NewTenantManager(cfg Config, store TenantStore, i *i18n.I18n, l *log.Logger) *TenantManager {
+	if cfg.BatchSize < 1 {
+		cfg.BatchSize = 1000
+	}
+	if cfg.Concurrency < 1 {
+		cfg.Concurrency = 1
+	}
+	if cfg.MessageRate < 1 {
+		cfg.MessageRate = 1
+	}
+
+	tm := &TenantManager{
+		cfg:            cfg,
+		tenantStore:    store,
+		i18n:           i,
+		log:            l,
+		tenantManagers: make(map[int]*tenantInstanceManager),
+		activeTenants:  make(map[int]bool),
+		shutdownCh:     make(chan struct{}),
+		fnNotify: func(tenantID int, subject string, data any) error {
+			return notifs.NotifySystem(subject, notifs.TplCampaignStatus, data, nil)
+		},
+	}
+	tm.tplFuncs = tm.makeGenericFuncMap()
+
+	return tm
+}
+
 // New returns a new instance of Mailer.
+// This function maintains backward compatibility for single-tenant deployments.
 func New(cfg Config, store Store, i *i18n.I18n, l *log.Logger) *Manager {
 	if cfg.BatchSize < 1 {
 		cfg.BatchSize = 1000
@@ -176,7 +336,74 @@ func New(cfg Config, store Store, i *i18n.I18n, l *log.Logger) *Manager {
 	}
 	m.tplFuncs = m.makeGnericFuncMap()
 
+	l.Printf("initialized single-tenant campaign manager (legacy mode)")
 	return m
+}
+
+// NewFromTenantStore creates a Manager that uses a TenantStore but operates in single-tenant mode.
+// This provides backward compatibility while using the new tenant-aware store interface.
+func NewFromTenantStore(cfg Config, store TenantStore, i *i18n.I18n, l *log.Logger) *Manager {
+	// Wrap the TenantStore to make it compatible with the legacy Store interface
+	legacyStore := &tenantStoreAdapter{
+		tenantStore: store,
+		defaultTenantID: 1, // Use tenant ID 1 as default for backward compatibility
+	}
+	
+	m := New(cfg, legacyStore, i, l)
+	l.Printf("initialized single-tenant campaign manager with tenant store adapter")
+	return m
+}
+
+// tenantStoreAdapter adapts a TenantStore to work with the legacy Store interface
+// by defaulting to a specific tenant ID for all operations
+type tenantStoreAdapter struct {
+	tenantStore     TenantStore
+	defaultTenantID int
+}
+
+// NextCampaigns adapts the tenant method to the legacy interface
+func (tsa *tenantStoreAdapter) NextCampaigns(currentIDs []int64, sentCounts []int64) ([]*models.Campaign, error) {
+	return tsa.tenantStore.NextTenantCampaigns(tsa.defaultTenantID, currentIDs, sentCounts)
+}
+
+// NextSubscribers adapts the tenant method to the legacy interface
+func (tsa *tenantStoreAdapter) NextSubscribers(campID, limit int) ([]models.Subscriber, error) {
+	return tsa.tenantStore.NextTenantSubscribers(tsa.defaultTenantID, campID, limit)
+}
+
+// GetCampaign adapts the tenant method to the legacy interface
+func (tsa *tenantStoreAdapter) GetCampaign(campID int) (*models.Campaign, error) {
+	return tsa.tenantStore.GetTenantCampaign(tsa.defaultTenantID, campID)
+}
+
+// GetAttachment uses the base store method
+func (tsa *tenantStoreAdapter) GetAttachment(mediaID int) (models.Attachment, error) {
+	return tsa.tenantStore.GetAttachment(mediaID)
+}
+
+// UpdateCampaignStatus adapts the tenant method to the legacy interface
+func (tsa *tenantStoreAdapter) UpdateCampaignStatus(campID int, status string) error {
+	return tsa.tenantStore.UpdateTenantCampaignStatus(tsa.defaultTenantID, campID, status)
+}
+
+// UpdateCampaignCounts adapts the tenant method to the legacy interface
+func (tsa *tenantStoreAdapter) UpdateCampaignCounts(campID int, toSend int, sent int, lastSubID int) error {
+	return tsa.tenantStore.UpdateTenantCampaignCounts(tsa.defaultTenantID, campID, toSend, sent, lastSubID)
+}
+
+// CreateLink adapts the tenant method to the legacy interface
+func (tsa *tenantStoreAdapter) CreateLink(url string) (string, error) {
+	return tsa.tenantStore.CreateTenantLink(tsa.defaultTenantID, url)
+}
+
+// BlocklistSubscriber adapts the tenant method to the legacy interface
+func (tsa *tenantStoreAdapter) BlocklistSubscriber(id int64) error {
+	return tsa.tenantStore.BlocklistTenantSubscriber(tsa.defaultTenantID, id)
+}
+
+// DeleteSubscriber adapts the tenant method to the legacy interface
+func (tsa *tenantStoreAdapter) DeleteSubscriber(id int64) error {
+	return tsa.tenantStore.DeleteTenantSubscriber(tsa.defaultTenantID, id)
 }
 
 // AddMessenger adds a Messenger messaging backend to the manager.
@@ -395,6 +622,324 @@ func (m *Manager) StopCampaign(id int) {
 func (m *Manager) Close() {
 	close(m.nextPipes)
 	close(m.msgQ)
+}
+
+// TenantManager Methods
+
+// AddMessenger adds a Messenger to all tenant instances.
+func (tm *TenantManager) AddMessenger(msg Messenger) error {
+	tm.tenantManagersMut.RLock()
+	defer tm.tenantManagersMut.RUnlock()
+
+	id := msg.Name()
+	// Add to all existing tenant managers
+	for _, t := range tm.tenantManagers {
+		if err := t.AddMessenger(msg); err != nil {
+			return fmt.Errorf("failed to add messenger to tenant %d: %v", t.tenantID, err)
+		}
+	}
+
+	return nil
+}
+
+// Run starts the multi-tenant campaign processing.
+func (tm *TenantManager) Run() {
+	// Start tenant discovery and lifecycle management
+	tm.wg.Add(1)
+	go tm.manageTenants()
+
+	// Start periodic tenant scanning
+	if tm.cfg.ScanCampaigns {
+		tm.wg.Add(1)
+		go tm.scanActiveTenants(tm.cfg.ScanInterval)
+	}
+
+	// Wait for shutdown
+	<-tm.shutdownCh
+	tm.wg.Wait()
+}
+
+// Close closes the tenant manager and all tenant instances.
+func (tm *TenantManager) Close() {
+	close(tm.shutdownCh)
+
+	// Stop all tenant instances
+	tm.tenantManagersMut.Lock()
+	for _, t := range tm.tenantManagers {
+		t.stop()
+	}
+	tm.tenantManagersMut.Unlock()
+
+	tm.wg.Wait()
+}
+
+// GetTenantCampaignStats returns campaign stats for a specific tenant.
+func (tm *TenantManager) GetTenantCampaignStats(tenantID, campID int) CampStats {
+	tm.tenantManagersMut.RLock()
+	defer tm.tenantManagersMut.RUnlock()
+
+	if t, exists := tm.tenantManagers[tenantID]; exists {
+		return t.GetCampaignStats(campID)
+	}
+	return CampStats{SendRate: 0}
+}
+
+// HasRunningCampaigns checks if any tenant has active campaigns.
+func (tm *TenantManager) HasRunningCampaigns() bool {
+	tm.tenantManagersMut.RLock()
+	defer tm.tenantManagersMut.RUnlock()
+
+	for _, t := range tm.tenantManagers {
+		if t.HasRunningCampaigns() {
+			return true
+		}
+	}
+	return false
+}
+
+// StopTenantCampaign stops a campaign for a specific tenant.
+func (tm *TenantManager) StopTenantCampaign(tenantID, campID int) {
+	tm.tenantManagersMut.RLock()
+	defer tm.tenantManagersMut.RUnlock()
+
+	if t, exists := tm.tenantManagers[tenantID]; exists {
+		t.StopCampaign(campID)
+	}
+}
+
+// manageTenants handles the discovery and lifecycle of tenant instances.
+func (tm *TenantManager) manageTenants() {
+	defer tm.wg.Done()
+
+	// Discover active tenants periodically
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	// Initial tenant discovery
+	tm.discoverActiveTenants()
+
+	for {
+		select {
+		case <-ticker.C:
+			tm.discoverActiveTenants()
+		case <-tm.shutdownCh:
+			return
+		}
+	}
+}
+
+// discoverActiveTenants finds active tenants and creates instances.
+func (tm *TenantManager) discoverActiveTenants() {
+	// Get list of active tenants from database
+	// This would need to be implemented in the TenantStore
+	tenantIDs, err := tm.getActiveTenantIDs()
+	if err != nil {
+		tm.log.Printf("error discovering active tenants: %v", err)
+		return
+	}
+
+	tm.activeTenantsMut.Lock()
+	tm.tenantManagersMut.Lock()
+	defer tm.activeTenantsMut.Unlock()
+	defer tm.tenantManagersMut.Unlock()
+
+	// Add new tenants
+	for _, tenantID := range tenantIDs {
+		if !tm.activeTenants[tenantID] {
+			if err := tm.createTenantInstance(tenantID); err != nil {
+				tm.log.Printf("error creating tenant instance %d: %v", tenantID, err)
+				continue
+			}
+			tm.activeTenants[tenantID] = true
+			tm.log.Printf("created tenant manager instance for tenant %d", tenantID)
+		}
+	}
+
+	// Remove inactive tenants
+	for tenantID := range tm.activeTenants {
+		found := false
+		for _, id := range tenantIDs {
+			if id == tenantID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if t, exists := tm.tenantManagers[tenantID]; exists {
+				t.stop()
+				delete(tm.tenantManagers, tenantID)
+				delete(tm.activeTenants, tenantID)
+				tm.log.Printf("removed tenant manager instance for tenant %d", tenantID)
+			}
+		}
+	}
+}
+
+// createTenantInstance creates a new tenant manager instance.
+func (tm *TenantManager) createTenantInstance(tenantID int) error {
+	// Load tenant-specific configuration
+	tenantCfg, err := tm.loadTenantConfig(tenantID)
+	if err != nil {
+		return fmt.Errorf("failed to load tenant config: %v", err)
+	}
+
+	// Create tenant instance
+	instance := &tenantInstanceManager{
+		tenantID:     tenantID,
+		cfg:          tenantCfg,
+		store:        tm.tenantStore,
+		i18n:         tm.i18n,
+		fnNotify:     tm.fnNotify,
+		log:          tm.log,
+		pipes:        make(map[int]*tenantPipe),
+		tpls:         make(map[int]*models.Template),
+		links:        make(map[string]string),
+		nextPipes:    make(chan *tenantPipe, 1000),
+		campMsgQ:     make(chan TenantCampaignMessage, tenantCfg.Concurrency*tenantCfg.MessageRate*2),
+		msgQ:         make(chan models.Message, tenantCfg.Concurrency*tenantCfg.MessageRate*2),
+		slidingStart: time.Now(),
+		active:       true,
+		stopCh:       make(chan struct{}),
+		messengers:   make(map[string]Messenger),
+		tplFuncs:     tm.tplFuncs,
+	}
+
+	// Start tenant instance
+	instance.wg.Add(1)
+	go instance.run()
+
+	tm.tenantManagers[tenantID] = instance
+	return nil
+}
+
+// getActiveTenantIDs retrieves list of active tenant IDs.
+// This would need to be implemented based on your tenant discovery logic.
+func (tm *TenantManager) getActiveTenantIDs() ([]int, error) {
+	// This is a placeholder - you would implement this to query the database
+	// for active tenants that have campaigns to process
+	return []int{1}, nil // Return default tenant for now
+}
+
+// loadTenantConfig loads tenant-specific configuration.
+func (tm *TenantManager) loadTenantConfig(tenantID int) (TenantConfig, error) {
+	// Load tenant settings from database
+	settings, err := tm.tenantStore.GetTenantSettings(tenantID)
+	if err != nil {
+		return TenantConfig{}, fmt.Errorf("failed to get tenant settings: %v", err)
+	}
+
+	// Create tenant-specific config based on base config and tenant settings
+	tenantCfg := TenantConfig{
+		Config:   tm.cfg,
+		TenantID: tenantID,
+	}
+
+	// Apply tenant-specific settings
+	if fromEmail, ok := settings["from_email"].(string); ok {
+		tenantCfg.TenantFromEmail = fromEmail
+	} else {
+		tenantCfg.TenantFromEmail = tm.cfg.FromEmail
+	}
+
+	if smtpHost, ok := settings["smtp_host"].(string); ok {
+		tenantCfg.TenantSMTPHost = smtpHost
+	}
+
+	if smtpPort, ok := settings["smtp_port"].(float64); ok {
+		tenantCfg.TenantSMTPPort = int(smtpPort)
+	}
+
+	if smtpUsername, ok := settings["smtp_username"].(string); ok {
+		tenantCfg.TenantSMTPUsername = smtpUsername
+	}
+
+	if smtpPassword, ok := settings["smtp_password"].(string); ok {
+		tenantCfg.TenantSMTPPassword = smtpPassword
+	}
+
+	// URLs with tenant context
+	tenantCfg.TenantRootURL = fmt.Sprintf("%s/tenant/%d", tm.cfg.RootURL, tenantID)
+	tenantCfg.TenantUnsubURL = fmt.Sprintf("%s/tenant/%d/subscription/%%s/%%s", tm.cfg.RootURL, tenantID)
+	tenantCfg.TenantOptinURL = fmt.Sprintf("%s/tenant/%d/subscription/optin/%%s?l=%%s", tm.cfg.RootURL, tenantID)
+	tenantCfg.TenantMessageURL = fmt.Sprintf("%s/tenant/%d/campaign/%%s/%%s", tm.cfg.RootURL, tenantID)
+	tenantCfg.TenantArchiveURL = fmt.Sprintf("%s/tenant/%d/archive", tm.cfg.RootURL, tenantID)
+
+	// Apply tenant-specific limits if present
+	if batchSize, ok := settings["max_batch_size"].(float64); ok && batchSize > 0 {
+		tenantCfg.TenantMaxBatchSize = int(batchSize)
+	} else {
+		tenantCfg.TenantMaxBatchSize = tm.cfg.BatchSize
+	}
+
+	if concurrency, ok := settings["max_concurrency"].(float64); ok && concurrency > 0 {
+		tenantCfg.TenantMaxConcurrency = int(concurrency)
+	} else {
+		tenantCfg.TenantMaxConcurrency = tm.cfg.Concurrency
+	}
+
+	if msgRate, ok := settings["message_rate"].(float64); ok && msgRate > 0 {
+		tenantCfg.TenantMessageRate = int(msgRate)
+	} else {
+		tenantCfg.TenantMessageRate = tm.cfg.MessageRate
+	}
+
+	if maxErrors, ok := settings["max_send_errors"].(float64); ok && maxErrors > 0 {
+		tenantCfg.TenantMaxSendErrors = int(maxErrors)
+	} else {
+		tenantCfg.TenantMaxSendErrors = tm.cfg.MaxSendErrors
+	}
+
+	return tenantCfg, nil
+}
+
+// scanActiveTenants periodically scans all active tenants for campaigns to process.
+func (tm *TenantManager) scanActiveTenants(interval time.Duration) {
+	defer tm.wg.Done()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			tm.tenantManagersMut.RLock()
+			for _, instance := range tm.tenantManagers {
+				if instance.IsActive() {
+					instance.triggerCampaignScan()
+				}
+			}
+			tm.tenantManagersMut.RUnlock()
+		case <-tm.shutdownCh:
+			return
+		}
+	}
+}
+
+// makeGenericFuncMap returns generic template functions for tenant manager.
+func (tm *TenantManager) makeGenericFuncMap() template.FuncMap {
+	funcs := template.FuncMap{
+		"Date": func(layout string) string {
+			if layout == "" {
+				layout = time.ANSIC
+			}
+			return time.Now().Format(layout)
+		},
+		"L": func() *i18n.I18n {
+			return tm.i18n
+		},
+		"Safe": func(safeHTML string) template.HTML {
+			return template.HTML(safeHTML)
+		},
+	}
+
+	// Copy sprig functions.
+	sprigFuncs := sprig.GenericFuncMap()
+	delete(sprigFuncs, "env")
+	delete(sprigFuncs, "expandenv")
+
+	maps.Copy(funcs, sprigFuncs)
+
+	return funcs
 }
 
 // scanCampaigns is a blocking function that periodically scans the data source

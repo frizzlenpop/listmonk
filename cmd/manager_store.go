@@ -1,7 +1,12 @@
 package main
 
 import (
+	"context"
+	"database/sql"
+	"fmt"
+
 	"github.com/gofrs/uuid/v5"
+	"github.com/jmoiron/sqlx"
 	"github.com/knadh/listmonk/internal/core"
 	"github.com/knadh/listmonk/internal/manager"
 	"github.com/knadh/listmonk/internal/media"
@@ -15,6 +20,7 @@ type store struct {
 	queries *models.Queries
 	core    *core.Core
 	media   media.Store
+	db      *sqlx.DB
 }
 
 type runningCamp struct {
@@ -25,11 +31,12 @@ type runningCamp struct {
 	ListID           int    `db:"list_id"`
 }
 
-func newManagerStore(q *models.Queries, c *core.Core, m media.Store) *store {
+func newManagerStore(q *models.Queries, c *core.Core, m media.Store, db *sqlx.DB) *store {
 	return &store{
 		queries: q,
 		core:    c,
 		media:   m,
+		db:      db,
 	}
 }
 
@@ -148,5 +155,173 @@ func (s *store) BlocklistSubscriber(id int64) error {
 // DeleteSubscriber deletes a subscriber from the DB.
 func (s *store) DeleteSubscriber(id int64) error {
 	_, err := s.queries.DeleteSubscribers.Exec(pq.Int64Array{id})
+	return err
+}
+
+// TenantStore implementation
+
+// NextTenantCampaigns retrieves active campaigns for a specific tenant
+func (s *store) NextTenantCampaigns(tenantID int, currentIDs []int64, sentCounts []int64) ([]*models.Campaign, error) {
+	var out []*models.Campaign
+	
+	// Set tenant context for RLS
+	if err := s.setTenantContext(tenantID); err != nil {
+		return nil, fmt.Errorf("failed to set tenant context: %v", err)
+	}
+	
+	// This would need a tenant-aware query - for now using existing query with RLS
+	err := s.queries.NextCampaigns.Select(&out, pq.Int64Array(currentIDs), pq.Int64Array(sentCounts))
+	return out, err
+}
+
+// NextTenantSubscribers retrieves subscribers for a campaign within a tenant
+func (s *store) NextTenantSubscribers(tenantID, campID, limit int) ([]models.Subscriber, error) {
+	if err := s.setTenantContext(tenantID); err != nil {
+		return nil, fmt.Errorf("failed to set tenant context: %v", err)
+	}
+	
+	// Get running campaign info with tenant context
+	var camps []runningCamp
+	if err := s.queries.GetRunningCampaign.Select(&camps, campID); err != nil {
+		return nil, err
+	}
+
+	var listIDs []int
+	for _, c := range camps {
+		listIDs = append(listIDs, c.ListID)
+	}
+
+	if len(listIDs) == 0 {
+		return nil, nil
+	}
+
+	var out []models.Subscriber
+	err := s.queries.NextCampaignSubscribers.Select(&out, camps[0].CampaignID, camps[0].CampaignType, camps[0].LastSubscriberID, camps[0].MaxSubscriberID, pq.Array(listIDs), limit)
+	return out, err
+}
+
+// GetTenantCampaign fetches a campaign from a specific tenant
+func (s *store) GetTenantCampaign(tenantID, campID int) (*models.Campaign, error) {
+	if err := s.setTenantContext(tenantID); err != nil {
+		return nil, fmt.Errorf("failed to set tenant context: %v", err)
+	}
+	
+	var out = &models.Campaign{}
+	err := s.queries.GetCampaign.Get(out, campID, nil, nil, "default")
+	return out, err
+}
+
+// GetTenantSettings retrieves tenant-specific settings (SMTP, etc.)
+func (s *store) GetTenantSettings(tenantID int) (map[string]interface{}, error) {
+	settings := make(map[string]interface{})
+	
+	rows, err := s.db.Query(`
+		SELECT key, value FROM tenant_settings 
+		WHERE tenant_id = $1
+	`, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var key string
+		var value sql.RawMessage
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, err
+		}
+		
+		// Try to unmarshal as JSON, fall back to string
+		var jsonValue interface{}
+		if len(value) > 0 && value[0] == '"' {
+			// It's a JSON string
+			var str string
+			if err := value.Unmarshal(&str); err == nil {
+				settings[key] = str
+			} else {
+				settings[key] = string(value)
+			}
+		} else if len(value) > 0 && (value[0] == '{' || value[0] == '[') {
+			// It's a JSON object/array
+			if err := value.Unmarshal(&jsonValue); err == nil {
+				settings[key] = jsonValue
+			} else {
+				settings[key] = string(value)
+			}
+		} else {
+			// Try to unmarshal as JSON, otherwise use as string
+			if err := value.Unmarshal(&jsonValue); err == nil {
+				settings[key] = jsonValue
+			} else {
+				settings[key] = string(value)
+			}
+		}
+	}
+
+	return settings, nil
+}
+
+// UpdateTenantCampaignStatus updates a campaign status within a tenant
+func (s *store) UpdateTenantCampaignStatus(tenantID, campID int, status string) error {
+	if err := s.setTenantContext(tenantID); err != nil {
+		return fmt.Errorf("failed to set tenant context: %v", err)
+	}
+	
+	_, err := s.queries.UpdateCampaignStatus.Exec(campID, status)
+	return err
+}
+
+// UpdateTenantCampaignCounts updates campaign counts for a tenant-specific campaign
+func (s *store) UpdateTenantCampaignCounts(tenantID, campID int, toSend int, sent int, lastSubID int) error {
+	if err := s.setTenantContext(tenantID); err != nil {
+		return fmt.Errorf("failed to set tenant context: %v", err)
+	}
+	
+	_, err := s.queries.UpdateCampaignCounts.Exec(campID, toSend, sent, lastSubID)
+	return err
+}
+
+// CreateTenantLink creates a tracking link for a tenant
+func (s *store) CreateTenantLink(tenantID int, url string) (string, error) {
+	if err := s.setTenantContext(tenantID); err != nil {
+		return "", fmt.Errorf("failed to set tenant context: %v", err)
+	}
+	
+	uu, err := uuid.NewV4()
+	if err != nil {
+		return "", err
+	}
+
+	var out string
+	if err := s.queries.CreateLink.Get(&out, uu, url); err != nil {
+		return "", err
+	}
+
+	return out, nil
+}
+
+// BlocklistTenantSubscriber blocklists a subscriber within a tenant
+func (s *store) BlocklistTenantSubscriber(tenantID int, id int64) error {
+	if err := s.setTenantContext(tenantID); err != nil {
+		return fmt.Errorf("failed to set tenant context: %v", err)
+	}
+	
+	_, err := s.queries.BlocklistSubscribers.Exec(pq.Int64Array{id})
+	return err
+}
+
+// DeleteTenantSubscriber deletes a subscriber within a tenant
+func (s *store) DeleteTenantSubscriber(tenantID int, id int64) error {
+	if err := s.setTenantContext(tenantID); err != nil {
+		return fmt.Errorf("failed to set tenant context: %v", err)
+	}
+	
+	_, err := s.queries.DeleteSubscribers.Exec(pq.Int64Array{id})
+	return err
+}
+
+// setTenantContext sets the PostgreSQL session variable for row-level security
+func (s *store) setTenantContext(tenantID int) error {
+	_, err := s.db.Exec("SELECT set_config('app.current_tenant', $1, false)", fmt.Sprintf("%d", tenantID))
 	return err
 }

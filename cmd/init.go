@@ -43,6 +43,7 @@ import (
 	"github.com/knadh/listmonk/internal/media/providers/s3"
 	"github.com/knadh/listmonk/internal/messenger/email"
 	"github.com/knadh/listmonk/internal/messenger/postback"
+	"github.com/knadh/listmonk/internal/middleware"
 	"github.com/knadh/listmonk/internal/notifs"
 	"github.com/knadh/listmonk/internal/subimporter"
 	"github.com/knadh/listmonk/models"
@@ -142,6 +143,14 @@ type Config struct {
 
 	PermissionsRaw json.RawMessage
 	Permissions    map[string]struct{}
+
+	// Tenant configuration
+	Tenant struct {
+		Enabled           bool   `koanf:"enabled"`
+		Strategy          string `koanf:"strategy"`          // subdomain, domain, header
+		DefaultTenantID   int    `koanf:"default_tenant_id"`
+		CreateDefaultTenant bool `koanf:"create_default_tenant"`
+	} `koanf:"tenant"`
 }
 
 // initFlags initializes the commandline flags into the Koanf instance.
@@ -446,6 +455,10 @@ func initConstConfig(ko *koanf.Koanf) *Config {
 		lo.Fatalf("error loading app.security config: %v", err)
 	}
 
+	if err := ko.Unmarshal("tenant", &c.Tenant); err != nil {
+		lo.Fatalf("error loading tenant config: %v", err)
+	}
+
 	if err := ko.UnmarshalWithConf("appearance", &c.Appearance, koanf.UnmarshalConf{FlatPaths: true}); err != nil {
 		lo.Fatalf("error loading app.appearance config: %v", err)
 	}
@@ -490,6 +503,69 @@ func initConstConfig(ko *koanf.Koanf) *Config {
 	}
 
 	return &c
+}
+
+// initTenantMiddleware initializes the tenant middleware if tenant mode is enabled.
+func initTenantMiddleware(db *sqlx.DB, queries *models.Queries, cfg *Config) *middleware.TenantMiddleware {
+	if !cfg.Tenant.Enabled {
+		return nil
+	}
+
+	lo.Println("tenant mode enabled")
+	
+	tm := middleware.NewTenantMiddleware(db, queries)
+	
+	// Create default tenant if configured
+	if cfg.Tenant.CreateDefaultTenant {
+		if err := createDefaultTenant(queries, db); err != nil {
+			lo.Printf("warning: failed to create default tenant: %v", err)
+		}
+	}
+	
+	return tm
+}
+
+// createDefaultTenant creates a default tenant if it doesn't exist.
+func createDefaultTenant(queries *models.Queries, db *sqlx.DB) error {
+	// Check if default tenant exists
+	var count int
+	err := db.Get(&count, "SELECT COUNT(*) FROM tenants WHERE id = 1")
+	if err != nil {
+		return fmt.Errorf("failed to check for default tenant: %w", err)
+	}
+	
+	// Default tenant already exists
+	if count > 0 {
+		lo.Println("default tenant already exists")
+		return nil
+	}
+	
+	// Create default tenant
+	defaultSettings := `{"site_name": "Default Tenant"}`
+	defaultFeatures := `{
+		"max_subscribers": 0,
+		"max_campaigns_per_month": 0,
+		"max_lists": 0,
+		"max_templates": 0,
+		"max_users": 0,
+		"custom_domain": true,
+		"api_access": true,
+		"webhooks_enabled": true,
+		"advanced_analytics": true
+	}`
+	
+	_, err = db.Exec(`
+		INSERT INTO tenants (id, uuid, name, slug, settings, features, status, created_at, updated_at)
+		VALUES (1, gen_random_uuid(), 'Default Tenant', 'default', $1, $2, 'active', NOW(), NOW())
+		ON CONFLICT (id) DO NOTHING
+	`, defaultSettings, defaultFeatures)
+	
+	if err != nil {
+		return fmt.Errorf("failed to create default tenant: %w", err)
+	}
+	
+	lo.Println("created default tenant")
+	return nil
 }
 
 // initI18n initializes a new i18n instance with the selected language map
@@ -863,6 +939,12 @@ func initHTTPServer(cfg *Config, urlCfg *UrlConfig, i *i18n.I18n, fs stuffbin.Fi
 			return next(c)
 		}
 	})
+
+	// Register tenant middleware if enabled.
+	if app.tenantMiddleware != nil {
+		srv.Use(app.tenantMiddleware.Middleware())
+		lo.Println("tenant middleware registered")
+	}
 
 	tpl, err := stuffbin.ParseTemplatesGlob(initTplFuncs(i, urlCfg), fs, "/public/templates/*.html")
 	if err != nil {

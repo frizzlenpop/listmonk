@@ -1,0 +1,113 @@
+# Multi-Tenant Listmonk Dockerfile
+# This Dockerfile is optimized for multi-tenant deployments with enhanced security
+# and tenant initialization capabilities
+
+FROM alpine:3.19 AS builder
+
+# Install build dependencies
+RUN apk --no-cache add \
+    ca-certificates \
+    tzdata \
+    curl \
+    git
+
+# Create application directory structure
+RUN mkdir -p /app/listmonk /app/uploads /app/templates /app/static
+
+WORKDIR /app
+
+# Copy build artifacts (assumes you're building from source or have binaries)
+# In production, replace this with your actual build process
+COPY listmonk /app/listmonk/
+COPY config.toml.sample /app/listmonk/config.toml
+
+# Copy static assets
+COPY static/ /app/listmonk/static/
+COPY frontend/dist/ /app/listmonk/static/
+
+# Final stage - multi-tenant production image
+FROM alpine:3.19
+
+# Install runtime dependencies for multi-tenancy
+RUN apk --no-cache add \
+    ca-certificates \
+    tzdata \
+    shadow \
+    su-exec \
+    postgresql-client \
+    redis \
+    curl \
+    wget \
+    jq \
+    bash \
+    && rm -rf /var/cache/apk/*
+
+# Create non-root user for security
+RUN addgroup -g 1001 listmonk && \
+    adduser -u 1001 -G listmonk -s /bin/sh -D listmonk
+
+# Create necessary directories with proper ownership
+RUN mkdir -p \
+    /listmonk \
+    /listmonk/uploads \
+    /listmonk/static \
+    /listmonk/logs \
+    /var/log/listmonk \
+    /etc/listmonk \
+    && chown -R listmonk:listmonk /listmonk /var/log/listmonk /etc/listmonk
+
+WORKDIR /listmonk
+
+# Copy application from builder stage
+COPY --from=builder --chown=listmonk:listmonk /app/listmonk/ ./
+
+# Copy enhanced entrypoint script for multi-tenancy
+COPY docker-entrypoint-multitenant.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Copy tenant initialization script
+COPY scripts/init-tenants.sh /usr/local/bin/init-tenants.sh
+RUN chmod +x /usr/local/bin/init-tenants.sh
+
+# Copy health check script
+COPY scripts/health-check.sh /usr/local/bin/health-check.sh
+RUN chmod +x /usr/local/bin/health-check.sh
+
+# Copy backup script for tenant data
+COPY scripts/backup-tenant.sh /usr/local/bin/backup-tenant.sh
+RUN chmod +x /usr/local/bin/backup-tenant.sh
+
+# Set proper permissions for uploads directory
+RUN chmod 755 /listmonk/uploads
+
+# Expose application port
+EXPOSE 9000
+
+# Health check with tenant context validation
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD /usr/local/bin/health-check.sh
+
+# Security: Use non-root user
+USER listmonk:listmonk
+
+# Set environment variables for multi-tenancy
+ENV LISTMONK_MULTITENANCY_ENABLED=true \
+    LISTMONK_TENANT_UPLOADS_SEGREGATED=true \
+    LISTMONK_LOG_LEVEL=info \
+    PUID=1001 \
+    PGID=1001
+
+# Use the enhanced entrypoint
+ENTRYPOINT ["docker-entrypoint.sh"]
+
+# Default command
+CMD ["./listmonk"]
+
+# Metadata
+LABEL maintainer="Listmonk Multi-Tenant <admin@yourdomain.com>" \
+      version="multi-tenant-1.0" \
+      description="Multi-tenant Listmonk with enhanced security and tenant isolation" \
+      org.opencontainers.image.title="Listmonk Multi-Tenant" \
+      org.opencontainers.image.description="Multi-tenant newsletter and mailing list manager" \
+      org.opencontainers.image.vendor="Listmonk" \
+      org.opencontainers.image.version="multi-tenant-1.0"

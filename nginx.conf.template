@@ -1,0 +1,214 @@
+# Multi-Tenant Listmonk Nginx Configuration Template
+# This configuration handles subdomain and custom domain routing for tenants
+
+# Main HTTP configuration
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    # Basic Settings
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    
+    # Performance Settings
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    client_max_body_size 50M;
+    
+    # Compression
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 10240;
+    gzip_proxied expired no-cache no-store private must-revalidate;
+    gzip_types
+        text/plain
+        text/css
+        text/xml
+        text/javascript
+        application/javascript
+        application/xml+rss
+        application/json;
+    
+    # Security Headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+    add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'" always;
+    
+    # Rate Limiting
+    limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+    limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;
+    
+    # Logging
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                   '$status $body_bytes_sent "$http_referer" '
+                   '"$http_user_agent" "$http_x_forwarded_for" '
+                   'tenant="$http_x_tenant_id" domain="$host"';
+    
+    access_log /var/log/nginx/access.log main;
+    
+    # Upstream Backend
+    upstream listmonk_backend {
+        server app:9000;
+        keepalive 32;
+    }
+    
+    # Helper map for tenant identification
+    map $host $tenant_header {
+        default "";
+        ~^(?<subdomain>[^.]+)\.listmonk\.${BASE_DOMAIN}$ $subdomain;
+    }
+    
+    # Rate limiting map
+    map $uri $rate_limit_zone {
+        default "";
+        ~^/api/auth/login$ login;
+        ~^/api/ api;
+    }
+    
+    # SSL Configuration (if using SSL)
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    
+    # Main server block for subdomain routing
+    server {
+        listen 80;
+        listen [::]:80;
+        server_name *.listmonk.${BASE_DOMAIN} ${BASE_DOMAIN};
+        
+        # SSL redirect (uncomment for production with SSL)
+        # return 301 https://$server_name$request_uri;
+        
+        # ACME challenge for Let's Encrypt
+        location /.well-known/acme-challenge/ {
+            root /var/www/html;
+            try_files $uri =404;
+        }
+        
+        # Rate limiting for sensitive endpoints
+        location /api/auth/login {
+            limit_req zone=login burst=3 nodelay;
+            proxy_pass http://listmonk_backend;
+            include /etc/nginx/proxy_params;
+        }
+        
+        # Rate limiting for API endpoints
+        location /api/ {
+            limit_req zone=api burst=20 nodelay;
+            proxy_pass http://listmonk_backend;
+            include /etc/nginx/proxy_params;
+        }
+        
+        # Main application
+        location / {
+            proxy_pass http://listmonk_backend;
+            include /etc/nginx/proxy_params;
+            
+            # Add tenant header if subdomain detected
+            proxy_set_header X-Tenant-Subdomain $tenant_header;
+            
+            # Security headers
+            proxy_hide_header X-Powered-By;
+        }
+        
+        # Health check endpoint (internal only)
+        location /nginx-health {
+            access_log off;
+            return 200 "healthy\n";
+            add_header Content-Type text/plain;
+        }
+    }
+    
+    # SSL server block (uncomment and configure for production)
+    # server {
+    #     listen 443 ssl http2;
+    #     listen [::]:443 ssl http2;
+    #     server_name *.listmonk.${BASE_DOMAIN} ${BASE_DOMAIN};
+    #     
+    #     # SSL Certificate
+    #     ssl_certificate /etc/nginx/ssl/fullchain.pem;
+    #     ssl_private_key /etc/nginx/ssl/privkey.pem;
+    #     
+    #     # HSTS Header
+    #     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    #     
+    #     # Rate limiting for sensitive endpoints
+    #     location /api/auth/login {
+    #         limit_req zone=login burst=3 nodelay;
+    #         proxy_pass http://listmonk_backend;
+    #         include /etc/nginx/proxy_params;
+    #     }
+    #     
+    #     # Rate limiting for API endpoints
+    #     location /api/ {
+    #         limit_req zone=api burst=20 nodelay;
+    #         proxy_pass http://listmonk_backend;
+    #         include /etc/nginx/proxy_params;
+    #     }
+    #     
+    #     # Main application
+    #     location / {
+    #         proxy_pass http://listmonk_backend;
+    #         include /etc/nginx/proxy_params;
+    #         
+    #         # Add tenant header if subdomain detected
+    #         proxy_set_header X-Tenant-Subdomain $tenant_header;
+    #         
+    #         # Security headers
+    #         proxy_hide_header X-Powered-By;
+    #     }
+    # }
+    
+    # Custom domain server block template
+    # Copy and customize this block for each tenant's custom domain
+    # server {
+    #     listen 80;
+    #     listen [::]:80;
+    #     listen 443 ssl http2;
+    #     listen [::]:443 ssl http2;
+    #     server_name mail.example-tenant.com;
+    #     
+    #     # SSL Configuration for custom domain
+    #     ssl_certificate /etc/nginx/ssl/custom-domains/example-tenant.com/fullchain.pem;
+    #     ssl_private_key /etc/nginx/ssl/custom-domains/example-tenant.com/privkey.pem;
+    #     
+    #     location / {
+    #         proxy_pass http://listmonk_backend;
+    #         include /etc/nginx/proxy_params;
+    #         
+    #         # Set tenant header for custom domain
+    #         proxy_set_header X-Tenant-Domain "mail.example-tenant.com";
+    #     }
+    # }
+}
+
+# Proxy parameters (create this file separately)
+# /etc/nginx/proxy_params content:
+# proxy_set_header Host $host;
+# proxy_set_header X-Real-IP $remote_addr;
+# proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+# proxy_set_header X-Forwarded-Proto $scheme;
+# proxy_set_header X-Forwarded-Host $host;
+# proxy_set_header X-Forwarded-Port $server_port;
+# proxy_redirect off;
+# proxy_buffering off;
+# proxy_request_buffering off;
+# proxy_http_version 1.1;
+# proxy_set_header Connection "";
+# proxy_connect_timeout 60s;
+# proxy_send_timeout 60s;
+# proxy_read_timeout 60s;
