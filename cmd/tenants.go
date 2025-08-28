@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/gofrs/uuid"
+       "github.com/gofrs/uuid/v5"
 	"github.com/knadh/listmonk/internal/middleware"
 	"github.com/knadh/listmonk/models"
 	"github.com/labstack/echo/v4"

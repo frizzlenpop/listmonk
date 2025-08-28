@@ -1,11 +1,12 @@
 package models
 
 import (
-	"database/sql/driver"
-	"time"
+        "database/sql/driver"
+        "encoding/json"
+        "fmt"
 
-	"github.com/jmoiron/sqlx/types"
-	null "gopkg.in/volatiletech/null.v6"
+        "github.com/jmoiron/sqlx/types"
+        null "gopkg.in/volatiletech/null.v6"
 )
 
 // TenantStatus represents the status of a tenant.
@@ -97,16 +98,16 @@ type TenantContext struct {
 
 // Scan implements the sql.Scanner interface for TenantFeatures.
 func (tf *TenantFeatures) Scan(src interface{}) error {
-	return types.JSONText(src.([]byte)).Unmarshal(tf)
+        b, ok := src.([]byte)
+        if !ok {
+                return fmt.Errorf("invalid type %T for TenantFeatures", src)
+        }
+        return json.Unmarshal(b, tf)
 }
 
 // Value implements the driver.Valuer interface for TenantFeatures.
 func (tf TenantFeatures) Value() (driver.Value, error) {
-	j, err := types.JSONText.MarshalJSON(types.JSONText(tf))
-	if err != nil {
-		return nil, err
-	}
-	return j, nil
+        return json.Marshal(tf)
 }
 
 // IsActive checks if the tenant is active.
