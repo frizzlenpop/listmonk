@@ -75,6 +75,18 @@ fix_permissions() {
     success "Permissions fixed"
 }
 
+# Detect Docker Compose command
+detect_docker_compose() {
+    if command -v docker-compose &> /dev/null; then
+        DOCKER_COMPOSE="docker-compose"
+    elif docker compose version &> /dev/null 2>&1; then
+        DOCKER_COMPOSE="docker compose"
+    else
+        error "Docker Compose is not installed (tried both docker-compose and docker compose)"
+    fi
+    log "Using Docker Compose command: $DOCKER_COMPOSE"
+}
+
 # Check prerequisites
 check_prerequisites() {
     log "Checking prerequisites..."
@@ -84,10 +96,8 @@ check_prerequisites() {
         error "Docker is not installed"
     fi
     
-    # Check Docker Compose
-    if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
-        error "Docker Compose is not installed"
-    fi
+    # Detect Docker Compose version
+    detect_docker_compose
     
     # Check for required files
     if [ ! -f "$PROJECT_DIR/docker-compose.multitenant.yml" ]; then
@@ -148,11 +158,11 @@ deploy_application() {
     
     # Pull latest images
     log "Pulling Docker images..."
-    docker-compose -f docker-compose.multitenant.yml pull
+    $DOCKER_COMPOSE -f docker-compose.multitenant.yml pull
     
     # Start services
     log "Starting services..."
-    docker-compose -f docker-compose.multitenant.yml up -d
+    $DOCKER_COMPOSE -f docker-compose.multitenant.yml up -d
     
     # Wait for database to be ready
     log "Waiting for database to be ready..."
@@ -247,10 +257,10 @@ show_deployment_info() {
     echo "Health Check: http://localhost:9000/api/health/tenants"
     echo
     echo "Docker Services:"
-    docker-compose -f docker-compose.multitenant.yml ps
+    $DOCKER_COMPOSE -f docker-compose.multitenant.yml ps
     echo
-    echo "Logs: docker-compose -f docker-compose.multitenant.yml logs -f"
-    echo "Stop: docker-compose -f docker-compose.multitenant.yml down"
+    echo "Logs: $DOCKER_COMPOSE -f docker-compose.multitenant.yml logs -f"
+    echo "Stop: $DOCKER_COMPOSE -f docker-compose.multitenant.yml down"
     echo
     echo "Configuration:"
     echo "- Environment: .env"
@@ -269,8 +279,11 @@ show_deployment_info() {
 rollback_deployment() {
     log "Rolling back deployment..."
     
+    # Detect docker compose command
+    detect_docker_compose
+    
     # Stop services
-    docker-compose -f docker-compose.multitenant.yml down
+    $DOCKER_COMPOSE -f docker-compose.multitenant.yml down
     
     # Restore from backup if available
     LATEST_BACKUP=$(ls -t "$BACKUP_DIR"/*.sql 2>/dev/null | head -1)
