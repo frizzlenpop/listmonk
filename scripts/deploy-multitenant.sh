@@ -108,6 +108,10 @@ check_prerequisites() {
         error ".env.multitenant.sample not found"
     fi
     
+    if [ ! -f "$PROJECT_DIR/migrations/001_add_multitenancy.sql" ]; then
+        error "migrations/001_add_multitenancy.sql not found"
+    fi
+    
     success "Prerequisites check passed"
 }
 
@@ -134,7 +138,7 @@ create_backup() {
     BACKUP_PATH="$BACKUP_DIR/$BACKUP_NAME"
     
     # If containers are running, backup database
-    if docker ps --format "table {{.Names}}" | grep -q "listmonk_db"; then
+    if docker ps --format "table {{.Names}}" | grep -q "listmonk_db_mt"; then
         log "Creating database backup..."
         docker exec listmonk_db_mt pg_dump -U listmonk listmonk > "$BACKUP_PATH.sql"
         
@@ -201,7 +205,7 @@ initialize_tenants() {
     
     # Apply the multi-tenancy migration
     log "Applying multi-tenancy database migration..."
-    if docker exec -i listmonk_db_mt psql -U listmonk -d listmonk < migrations/001_add_multitenancy.sql; then
+    if docker exec -i listmonk_db_mt psql -U listmonk -d listmonk < "$PROJECT_DIR/migrations/001_add_multitenancy.sql"; then
         success "Multi-tenancy migration applied successfully"
     else
         warning "Migration may have failed or was already applied"
