@@ -134,9 +134,9 @@ create_backup() {
     BACKUP_PATH="$BACKUP_DIR/$BACKUP_NAME"
     
     # If containers are running, backup database
-    if docker ps --format "table {{.Names}}" | grep -q "listmonk-db"; then
+    if docker ps --format "table {{.Names}}" | grep -q "listmonk_db"; then
         log "Creating database backup..."
-        docker exec listmonk-db pg_dump -U listmonk listmonk > "$BACKUP_PATH.sql"
+        docker exec listmonk_db_mt pg_dump -U listmonk listmonk > "$BACKUP_PATH.sql"
         
         # Backup uploads if they exist
         if [ -d "$PROJECT_DIR/uploads" ]; then
@@ -167,7 +167,7 @@ deploy_application() {
     # Wait for database to be ready
     log "Waiting for database to be ready..."
     for i in {1..30}; do
-        if docker exec listmonk-db pg_isready -U listmonk &> /dev/null; then
+        if docker exec listmonk_db_mt pg_isready -U listmonk &> /dev/null; then
             success "Database is ready"
             break
         fi
@@ -189,15 +189,33 @@ deploy_application() {
 initialize_tenants() {
     log "Initializing tenant system..."
     
-    # Run tenant initialization
-    docker exec listmonk-app /app/scripts/init-tenants.sh
+    # Wait for app to be fully ready
+    log "Waiting for application to be ready..."
+    for i in {1..30}; do
+        if curl -s http://localhost:9000/api/health > /dev/null 2>&1; then
+            success "Application is ready"
+            break
+        fi
+        sleep 2
+    done
+    
+    # Apply the multi-tenancy migration
+    log "Applying multi-tenancy database migration..."
+    if docker exec -i listmonk_db_mt psql -U listmonk -d listmonk < migrations/001_add_multitenancy.sql; then
+        success "Multi-tenancy migration applied successfully"
+    else
+        warning "Migration may have failed or was already applied"
+    fi
     
     # Verify default tenant exists
     log "Verifying default tenant..."
-    if docker exec listmonk-db psql -U listmonk -d listmonk -c "SELECT COUNT(*) FROM tenants;" | grep -q "1"; then
-        success "Default tenant initialized"
+    TENANT_COUNT=$(docker exec listmonk_db_mt psql -U listmonk -d listmonk -t -c "SELECT COUNT(*) FROM tenants WHERE id = 1;" 2>/dev/null | tr -d ' ')
+    if [ "$TENANT_COUNT" = "1" ]; then
+        success "Default tenant exists"
+    elif [ "$TENANT_COUNT" = "0" ]; then
+        log "Default tenant not found, will be created on first admin login"
     else
-        warning "Default tenant may not be properly initialized"
+        warning "Could not verify tenant status"
     fi
 }
 
@@ -221,7 +239,7 @@ run_health_checks() {
     fi
     
     # Check database connection
-    if docker exec listmonk-db psql -U listmonk -d listmonk -c "SELECT 1;" > /dev/null; then
+    if docker exec listmonk_db_mt psql -U listmonk -d listmonk -c "SELECT 1;" > /dev/null; then
         success "Database connection check passed"
     else
         error "Database connection check failed"
@@ -236,7 +254,7 @@ migrate_existing_data() {
         log "Migrating existing data to multi-tenant structure..."
         
         # Run migration script
-        docker exec listmonk-app /app/scripts/migrate-to-multitenancy.sh
+        docker exec listmonk_app_mt /app/scripts/migrate-to-multitenancy.sh
         
         success "Data migration completed"
     else
@@ -291,7 +309,7 @@ rollback_deployment() {
         read -p "Restore database from backup $LATEST_BACKUP? (y/N): " restore_choice
         if [[ $restore_choice =~ ^[Yy]$ ]]; then
             log "Restoring database from backup..."
-            docker exec -i listmonk-db psql -U listmonk -d listmonk < "$LATEST_BACKUP"
+            docker exec -i listmonk_db_mt psql -U listmonk -d listmonk < "$LATEST_BACKUP"
             success "Database restored from backup"
         fi
     fi
