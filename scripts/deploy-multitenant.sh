@@ -160,9 +160,13 @@ deploy_application() {
     
     cd "$PROJECT_DIR"
     
-    # Pull latest images
-    log "Pulling Docker images..."
-    $DOCKER_COMPOSE -f docker-compose.multitenant.yml pull
+    # Build custom multi-tenant image
+    log "Building multi-tenant Listmonk image..."
+    $DOCKER_COMPOSE -f docker-compose.multitenant.yml build --no-cache
+    
+    # Pull other images (database, redis)
+    log "Pulling supporting Docker images..."
+    $DOCKER_COMPOSE -f docker-compose.multitenant.yml pull db redis
     
     # Start services
     log "Starting services..."

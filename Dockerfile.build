@@ -1,0 +1,91 @@
+# Multi-stage Dockerfile for building Listmonk with multi-tenancy support
+# This builds from source code in the current directory
+
+# Build stage
+FROM golang:1.21-alpine AS builder
+
+# Install build dependencies
+RUN apk --no-cache add \
+    ca-certificates \
+    tzdata \
+    git \
+    make \
+    nodejs \
+    npm \
+    python3 \
+    build-base
+
+WORKDIR /app
+
+# Copy go mod files first for better caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the frontend if it exists
+RUN if [ -d "frontend" ]; then \
+        cd frontend && \
+        npm ci --only=production && \
+        npm run build && \
+        cd ..; \
+    fi
+
+# Build the Go application with multi-tenancy support
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-w -s" -o listmonk ./cmd
+
+# Runtime stage
+FROM alpine:3.19
+
+# Install runtime dependencies
+RUN apk --no-cache add \
+    ca-certificates \
+    tzdata \
+    postgresql-client \
+    curl \
+    wget \
+    bash \
+    su-exec \
+    shadow
+
+# Create listmonk user
+RUN addgroup -g 1001 listmonk && \
+    adduser -u 1001 -G listmonk -s /bin/sh -D listmonk
+
+# Create directories
+RUN mkdir -p /listmonk/uploads /listmonk/static && \
+    chown -R listmonk:listmonk /listmonk
+
+WORKDIR /listmonk
+
+# Copy binary from builder
+COPY --from=builder /app/listmonk ./
+COPY --from=builder /app/config.toml.sample ./config.toml
+
+# Copy static files if they exist
+COPY --from=builder /app/static/ ./static/
+COPY --from=builder /app/frontend/dist/ ./static/ 2>/dev/null || true
+
+# Copy queries.sql (our modified version with tenant support)
+COPY --from=builder /app/queries.sql ./
+
+# Copy Docker entrypoint
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Set ownership
+RUN chown -R listmonk:listmonk /listmonk
+
+# Expose port
+EXPOSE 9000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:9000/api/health || exit 1
+
+# Use listmonk user
+USER listmonk:listmonk
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["./listmonk"]
